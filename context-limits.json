@@ -1,0 +1,22 @@
+{
+  "moonshotai/kimi-k3": 300000,
+  "nvidia/nemotron-3.5-lightning-30b-a3b": 750000,
+  "nvidia/nemotron-3-super-120b-a12b": 750000,
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": 340000,
+  "poolside/laguna-xs-2.1": 190000,
+  "openai/gpt-oss-20b": 97000,
+  "meta/muse-glimmer-30b": 200000,
+  "nvidia/nemotron-3-ultra-550b-a55b": 131072,
+  "deepseek-ai/deepseek-v4.1-flash": 210000,
+  "z-ai/glm-5.3-flash": 1048576,
+  "z-ai/glm-5.3": 1048576,
+  "google/gemma-4-31b-it": 131072,
+  "meta/llama-3.2-11b-vision-instruct": 131072,
+  "nvidia/ising-calibration-1.5-31b": 131072,
+  "nvidia/llama-3.1-nemotron-safety-guard-8b-v3": 131072,
+  "nvidia/nemotron-3.5-content-safety": 131072,
+  "nvidia/nemotron-parse-2.0": 4096,
+  "nvidia/riva-translate-4b-instruct-v1.1": 8192,
+  "nvidia/riva-translate-4b-instruct-v2": 8192,
+  "mistralai/mistral-nemotron": 262144
+}

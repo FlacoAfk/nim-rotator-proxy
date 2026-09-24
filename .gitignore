@@ -1,0 +1,15 @@
+# secrets & runtime state — NEVER commit these
+data/
+data/**
+
+# local overrides
+*.local.json
+proxy.local.json
+
+# python
+__pycache__/
+*.pyc
+
+# os/editor noise
+.DS_Store
+Thumbs.db
