@@ -238,6 +238,35 @@ def cmd_token(value):
     save(doc)
 
 
+def cmd_catalog():
+    """Show the catalog watcher status: snapshot age + last diff."""
+    cat_path = os.path.join(DATA_DIR, "catalog.json")
+    dif_path = os.path.join(DATA_DIR, "catalog-diff.json")
+    try:
+        with open(cat_path, encoding="utf-8-sig") as f:
+            cat = json.load(f)
+        age = time.time() - cat.get("checked_at", 0)
+        print(c("catalog snapshot: %d models (checked %s, %.1fh ago)" % (
+            len(cat.get("models") or []),
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(cat.get("checked_at", 0))),
+            age / 3600), CYAN))
+    except Exception:
+        print(c("no catalog snapshot yet — the proxy writes one on its first check", YELLOW))
+    try:
+        with open(dif_path, encoding="utf-8-sig") as f:
+            dif = json.load(f)
+        print(c("last diff (%s):" % time.strftime("%Y-%m-%d %H:%M", time.localtime(dif.get("checked_at", 0))), BOLD))
+        for m in dif.get("added") or []:
+            print("  " + c("+ %s" % m, GREEN))
+        for m in dif.get("removed") or []:
+            print("  " + c("- %s" % m, RED))
+        if not (dif.get("added") or dif.get("removed")):
+            print(dim_text("  (no changes)"))
+    except Exception:
+        print(dim_text("no diff recorded yet"))
+    print(dim_text("force a check now:  python proxy.py catalog"))
+
+
 def cmd_fallback(onoff):
     doc = load()
     doc["allow_pool_fallback"] = onoff in ("on", "true", "1", "yes")
@@ -252,7 +281,7 @@ MENU = """
  {b}2){r} remove key         {b}6){r} test key (chat)
  {b}3){r} enable/disable     {b}7){r} set pool_token
  {b}4){r} refresh            {b}8){r} toggle pool fallback
- {b}0){r} quit
+ {b}9){r} catalog status     {b}0){r} quit
 """
 
 
@@ -282,6 +311,8 @@ def dashboard():
             cmd_token(input("pool_token value ('-' to clear): ").strip())
         elif choice == "8":
             cmd_fallback(input("allow_pool_fallback on/off: ").strip())
+        elif choice == "9":
+            cmd_catalog()
         elif choice in ("0", "q", ""):
             print(dim_text("bye"))
             return
@@ -307,6 +338,8 @@ def run():
         cmd_token(rest[0] if rest else "")
     elif cmd == "fallback":
         cmd_fallback(rest[0] if rest else "on")
+    elif cmd == "catalog":
+        cmd_catalog()
     else:
         print(__doc__)
 

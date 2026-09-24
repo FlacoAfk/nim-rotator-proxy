@@ -32,6 +32,7 @@ NVIDIA's NIM endpoint has a few sharp edges that break real-world clients:
 - **Big-context conversion** — buffered upstream + faithful SSE replay (role → reasoning → content slices → `tool_calls` in NIM-native continuation style → finish chunk with `usage` → `[DONE]`), with the strict-SSE format that Vercel AI SDK (ZCode), opencode and kilo parse cleanly.
 - **BYOK** — callers may authenticate with their own NIM key; the proxy tracks its health separately from the pool.
 - **Interactive key manager** — a small ANSI dashboard to add/validate/test/remove keys, set the pool token and check per-key stats (`python proxy.py keys`).
+- **Automatic catalog watcher** — periodically polls NIM's `/v1/models` (one metadata GET, no inference), detects models NVIDIA **adds or removes**, logs the diff, persists a snapshot + diff file, and proactively cools removed models so requests fail fast. `/health` and the key dashboard show the current status. Configure with `catalog_refresh_s` (default 6 h) — near-zero resource usage.
 - **Zero dependencies** — Python 3.9+ standard library only. Runs on Windows, Linux and macOS.
 - **Secret hygiene** — keys live in `data/keys.json` (gitignored), are never logged (only short hash prefixes), and state files are written atomically.
 
@@ -143,6 +144,9 @@ variables override everything (`NIM_PROXY_*`):
 | `default_context` | — | `131072` | Guard ceiling for models missing from the limits file |
 | `guard_ratio` | — | `0.9` | Fraction of the window the guard allows |
 | `fallback_models` | — | `[]` | Ordered model ids tried when the primary fails upstream |
+| `catalog_enabled` | — | `true` | Watch NIM's catalog for added/removed models |
+| `catalog_refresh_s` | `NIM_PROXY_CATALOG_REFRESH_S` | `21600` | Seconds between catalog checks (6 h; one metadata GET each) |
+| `catalog_poll_key_id` | — | *(empty)* | Specific key id used to poll the catalog (default: first pool key, else the last BYOK key seen) |
 
 Files (all auto-created):
 
@@ -152,7 +156,21 @@ Files (all auto-created):
 | `data/state.json` | Cooldowns, per-key stats, dead-model cooldowns (atomic writes) |
 | `data/proxy.json` | Server config |
 | `data/proxy.log` | Log (auto-rotates at 1 MB; keys are never written, only hash ids) |
+| `data/catalog.json` | Latest upstream model snapshot (written by the catalog watcher) |
+| `data/catalog-diff.json` | Last detected change (added/removed model ids) |
 | `context-limits.json` | Measured per-model context windows used by the guard |
+
+### Catalog watcher
+
+NVIDIA adds and removes models without notice. The watcher keeps the proxy aware:
+
+```bash
+python proxy.py catalog        # force a check now and print the status/diff
+```
+
+- **Model added** → logged as `CATALOG | + model-id`, recorded in `data/catalog-diff.json`, and visible in `/health` and the key dashboard. New models work immediately through the proxy (the guard uses `default_context` until you measure their real window and add it to `context-limits.json`).
+- **Model removed** → logged as `CATALOG | - model-id` and proactively cooled for 1 h so clients fail fast (with fallback, if configured) instead of burning a request on a dead model.
+- Runs in a daemon thread that sleeps between checks — one metadata GET every `catalog_refresh_s`, essentially zero CPU/memory overhead. Failures are logged and retried next interval; the proxy never crashes or blocks on it.
 
 ## Using with clients
 

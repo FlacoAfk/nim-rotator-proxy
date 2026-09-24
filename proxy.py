@@ -49,6 +49,8 @@ DATA_DIR = os.environ.get("NIM_PROXY_DATA_DIR", os.path.join(BASE_DIR, "data"))
 KEYS_FILE = os.path.join(DATA_DIR, "keys.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 LOG_FILE = os.path.join(DATA_DIR, "proxy.log")
+CATALOG_FILE = os.path.join(DATA_DIR, "catalog.json")
+CATALOG_DIFF_FILE = os.path.join(DATA_DIR, "catalog-diff.json")
 LIMITS_FILE = os.environ.get(
     "NIM_PROXY_LIMITS_FILE", os.path.join(BASE_DIR, "context-limits.json")
 )
@@ -70,6 +72,9 @@ DEFAULT_CONFIG = {
     "guard_ratio": 0.9,
     "fallback_models": [],         # ordered nvidia model ids to try if primary fails
     "slow_request_ms": 30000,
+    "catalog_enabled": True,       # watch NIM's /v1/models for added/removed models
+    "catalog_refresh_s": 21600,    # 6 h between catalog checks (single cheap GET)
+    "catalog_poll_key_id": "",     # optional explicit key id used for polling
 }
 
 KEY_COOLDOWN_S = 300
@@ -123,6 +128,7 @@ def load_config():
     cfg["keepalive_s"] = _env_positive_float("NIM_PROXY_STREAM_KEEPALIVE_S", cfg["keepalive_s"])
     cfg["ttfb_timeout_s"] = _env_positive_float("NIM_PROXY_TTFB_TIMEOUT_S", cfg["ttfb_timeout_s"])
     cfg["upstream_timeout_s"] = _env_positive_float("NIM_PROXY_UPSTREAM_TIMEOUT_S", cfg["upstream_timeout_s"])
+    cfg["catalog_refresh_s"] = _env_positive_float("NIM_PROXY_CATALOG_REFRESH_S", cfg["catalog_refresh_s"])
     return cfg
 
 
@@ -325,6 +331,124 @@ STATE = State()
 
 
 # --------------------------------------------------------------------------
+# catalog watcher (detect NIM model additions/removals)
+# --------------------------------------------------------------------------
+
+CATALOG_STATUS = {
+    "enabled": bool(CFG.get("catalog_enabled")),
+    "last_check": 0.0,
+    "models": 0,
+    "added": [],       # most recent first, capped
+    "removed": [],
+    "last_error": "",
+}
+_LAST_BYOK_KEY = None       # in-memory only: fallback poll key for BYOK-only setups
+_byok_lock = threading.Lock()
+
+
+def _remember_byok_key(key):
+    global _LAST_BYOK_KEY
+    with _byok_lock:
+        _LAST_BYOK_KEY = key
+
+
+def _atomic_write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+def fetch_catalog(key, timeout=30):
+    """GET /v1/models upstream with a single key; returns [ids] or None."""
+    try:
+        conn = http.client.HTTPSConnection(UPSTREAM_HOST, timeout=timeout)
+        conn.request("GET", "/v1/models", None, {
+            "Authorization": "Bearer " + key,
+            "Accept": "application/json",
+        })
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        if resp.status != 200:
+            return None
+        return [m.get("id") for m in (json.loads(raw).get("data") or []) if m.get("id")]
+    except Exception:
+        return None
+
+
+def check_catalog_once():
+    """Poll NIM's model list, diff against the stored snapshot, record changes.
+
+    Cheap by design: one metadata GET per interval, no inference requests."""
+    prev = {}
+    try:
+        with open(CATALOG_FILE, encoding="utf-8-sig") as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        prev = {}
+    prev_models = set(prev.get("models") or [])
+
+    doc = load_keys_doc()
+    poll_key = None
+    want_id = CFG.get("catalog_poll_key_id") or ""
+    for e in doc.get("keys") or []:
+        if e.get("enabled", True) and e.get("key") and (not want_id or e.get("id") == want_id):
+            poll_key = e["key"]
+            break
+    if poll_key is None:
+        with _byok_lock:
+            poll_key = _LAST_BYOK_KEY
+    if not poll_key:
+        CATALOG_STATUS["last_error"] = "no key available to poll the catalog"
+        return
+
+    models = fetch_catalog(poll_key)
+    if models is None:
+        CATALOG_STATUS["last_error"] = "catalog fetch failed (upstream unreachable or key rejected)"
+        log("CATALOG | fetch failed — keeping previous snapshot")
+        return
+    CATALOG_STATUS["last_error"] = ""
+
+    now = time.time()
+    cur = set(models)
+    added = sorted(cur - prev_models) if prev_models else []
+    removed = sorted(prev_models - cur) if prev_models else []
+    _atomic_write_json(CATALOG_FILE, {"checked_at": now, "models": models})
+
+    if added or removed:
+        _atomic_write_json(CATALOG_DIFF_FILE, {
+            "checked_at": now, "added": added, "removed": removed,
+            "previous_count": len(prev_models), "current_count": len(models),
+        })
+    for m in added:
+        log("CATALOG | + %s (new model available upstream)" % m)
+    for m in removed:
+        log("CATALOG | - %s (removed from NIM catalog)" % m)
+        # fail fast for the next hour instead of learning about it per-request
+        STATE.note_model_dead(m, 3600)
+
+    CATALOG_STATUS.update({
+        "last_check": now,
+        "models": len(models),
+        "added": (added + CATALOG_STATUS.get("added", []))[:20],
+        "removed": (removed + CATALOG_STATUS.get("removed", []))[:20],
+    })
+
+
+def catalog_loop():
+    # first check shortly after startup (server must bind first), then sleep long
+    time.sleep(60)
+    while True:
+        try:
+            check_catalog_once()
+        except Exception as e:
+            CATALOG_STATUS["last_error"] = "check crashed: %s" % type(e).__name__
+            log("CATALOG | check crashed: %s" % type(e).__name__)
+        time.sleep(max(60, float(CFG.get("catalog_refresh_s") or 21600)))
+
+
+# --------------------------------------------------------------------------
 # token estimation + context guard
 # --------------------------------------------------------------------------
 
@@ -490,6 +614,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/health", "/healthz"):
             pool = load_pool_keys()
+            cs = dict(CATALOG_STATUS)
+            cs["next_check_in_s"] = max(0, int(
+                (60 if not cs["last_check"] else
+                 cs["last_check"] + max(60, float(CFG.get("catalog_refresh_s") or 21600)))
+                - time.time())) if cs.get("enabled") else None
             self._send_json(200, {
                 "ok": True,
                 "service": "nim-rotator-proxy",
@@ -497,6 +626,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pool_keys": len(pool),
                 "host": CFG["host"],
                 "port": CFG["port"],
+                "catalog": cs,
             })
             return
         if self.path.startswith("/v1/"):
@@ -539,6 +669,8 @@ class Handler(BaseHTTPRequestHandler):
                 "message": "[nim-rotator-proxy] unauthorized: send your own nvapi-... key "
                            "as the Bearer token, or the proxy pool_token."}})
             return
+        if mode == "byok" and byok_key:
+            _remember_byok_key(byok_key)
 
         # ---- parse chat payload + pre-flight context guard ----
         model = None
@@ -1321,6 +1453,16 @@ def main():
         import keymanager
         keymanager.run()
         return
+    if argv and argv[0] == "catalog":
+        check_catalog_once()
+        cs = dict(CATALOG_STATUS)
+        print("models: %s | last_check: %s" % (
+            cs.get("models"), time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cs["last_check"])) if cs["last_check"] else "never"))
+        print("added:   %s" % (cs.get("added") or "(none)"))
+        print("removed: %s" % (cs.get("removed") or "(none)"))
+        if cs.get("last_error"):
+            print("last_error:", cs["last_error"])
+        return
     host = CFG["host"]
     port = CFG["port"]
     if "--port" in argv:
@@ -1335,10 +1477,16 @@ def main():
         print(msg)
         return
     srv.daemon_threads = True
+    if CFG.get("catalog_enabled"):
+        threading.Thread(target=catalog_loop, daemon=True).start()
     pool_n = len(load_pool_keys())
     log("START | %s:%d | version=%s | pool_keys=%d" % (host, port, __version__, pool_n))
     print("nim-rotator-proxy v%s listening on http://%s:%d" % (__version__, host, port))
     print("  pool keys: %d | guard limits: %s" % (pool_n, os.path.basename(LIMITS_FILE)))
+    if CFG.get("catalog_enabled"):
+        print("  catalog watcher: on (every %s) — data/catalog.json" % (
+            "%dh" % (float(CFG["catalog_refresh_s"]) / 3600) if float(CFG["catalog_refresh_s"]) % 3600 == 0
+            else "%ds" % CFG["catalog_refresh_s"]))
     if host not in ("127.0.0.1", "localhost", "::1"):
         print("  WARNING: serving non-local clients. Make sure data/keys.json has a pool_token")
         print("  or rely on BYOK (callers send their own nvapi-... key as the Bearer token).")
