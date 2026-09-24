@@ -74,10 +74,15 @@ Non-local callers must then authenticate one of two ways:
 1. **BYOK (recommended for shared setups)** — each user puts *their own* NIM key
    as the Bearer token in their client. The proxy uses that key for that user's
    requests, tracks its cooldowns separately, and never shares it with other
-   callers. Your pool is untouched.
+   callers. Your pool is untouched. **This is also the compliant way to share:
+   NVIDIA's terms make each user responsible for their own key, and restrict
+   making the service available to others under your key** (see
+   [DISCLAIMER.md](DISCLAIMER.md)).
 2. **Pool token** — set a `pool_token` in `data/keys.json`; callers who send it as
-   the Bearer token rotate through the *server's* key pool (use this for your own
-   machines). If no `pool_token` is set, the pool is localhost-only.
+   the Bearer token rotate through the *server's* key pool (intended for the
+   operator's own machines — sharing pooled keys with third parties may conflict
+   with NVIDIA's Trial Terms §4.2). If no `pool_token` is set, the pool is
+   localhost-only.
 
 Optional: `"allow_pool_fallback": true` lets BYOK requests fall back to the pool
 when the user's own key is rate-limited (off by default — nobody burns someone
@@ -269,6 +274,21 @@ speaks plain HTTP on its port.
 
 **What happens if a key dies?** 401/403 cooldowns it for 24 h and it shows as
 `cooling` in the dashboard; remove it with `python keymanager.py remove <id>`.
+
+## Legal
+
+**Not affiliated with NVIDIA.** This is a community tool that forwards HTTP
+requests you are already authorized to make; it redistributes no models or
+NVIDIA content. **You are solely responsible for your API keys and your usage**,
+which are governed by NVIDIA's own agreements — in particular the
+[NVIDIA API Trial Terms of Service](https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf)
+(trial/evaluation service, not production; §4.2 restricts making the service
+available to others; NVIDIA may discontinue or revoke at any time), the
+[NVIDIA Developer Terms](https://developer.nvidia.com/legal/terms)
+(credentials are for your use only and are your responsibility), and the
+[NVIDIA Privacy Policy](https://www.nvidia.com/en-us/about-nvidia/privacy-policy/).
+Use BYOK when serving multiple people. Full details in
+[DISCLAIMER.md](DISCLAIMER.md) (English / Español).
 
 ## License
 
