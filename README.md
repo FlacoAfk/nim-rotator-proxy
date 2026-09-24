@@ -31,7 +31,8 @@ NVIDIA's NIM endpoint has a few sharp edges that break real-world clients:
 - **Context guard** — per-model measured windows in `context-limits.json`; rejects oversized requests *before* burning any key with a clear message.
 - **Big-context conversion** — buffered upstream + faithful SSE replay (role → reasoning → content slices → `tool_calls` in NIM-native continuation style → finish chunk with `usage` → `[DONE]`), with the strict-SSE format that Vercel AI SDK (ZCode), opencode and kilo parse cleanly.
 - **BYOK** — callers may authenticate with their own NIM key; the proxy tracks its health separately from the pool.
-- **Interactive key manager** — a small ANSI dashboard to add/validate/test/remove keys, set the pool token and check per-key stats (`python proxy.py keys`).
+- **Interactive key manager** — a small ANSI dashboard to add/validate/test/remove keys, set the pool token, and review **live telemetry: token usage (total and per model), per-key request/token counts, key health (ok / cooling / revoked), guard rejections, stream conversions, fallbacks, client aborts and proxy uptime** (`python proxy.py keys`).
+- **Usage telemetry built in** — the proxy extracts `usage` from every response path (buffered, converted and native streams — it injects `stream_options.include_usage` when the client didn't ask for it) and accumulates totals/per-model/per-key counters in `data/state.json`, flushed at least every 30 s.
 - **Automatic catalog watcher** — periodically polls NIM's `/v1/models` (one metadata GET, no inference), detects models NVIDIA **adds or removes**, logs the diff, persists a snapshot + diff file, and proactively cools removed models so requests fail fast. `/health` and the key dashboard show the current status. Configure with `catalog_refresh_s` (default 6 h) — near-zero resource usage.
 - **Zero dependencies** — Python 3.9+ standard library only. Runs on Windows, Linux and macOS.
 - **Secret hygiene** — keys live in `data/keys.json` (gitignored), are never logged (only short hash prefixes), and state files are written atomically.
@@ -102,15 +103,24 @@ python proxy.py keys          # interactive dashboard (same as: python keymanage
 ╔══════════════════════════════════════════════════╗
 ║   nim-rotator-proxy — API key manager            ║
 ╚══════════════════════════════════════════════════╝
- id         key                label       status   req    ok    429
- a1b2c3d4e5 nvapi-AbCd...XyZ  laptop      ok       412    409   3
- f6e5d4c3b2 nvapi-...         desktop     cooling 1m ...
+ id         key              label       status      req    ok    429    tokens
+ a1b2c3d4e5 nvapi-AbCd...XyZ laptop      ok          412    409   3      1,204,551
+ f6e5d4c3b2 nvapi-...        desktop     cooling 1m  ...
  pool_token : rot12...
  pool fallback for BYOK 429s: OFF
 
+ usage since proxy start — uptime 5h12m
+--------------------------------------------------------------------------------------------------------------
+ total: 1,208 completions | 3,101,442 prompt + 88,204 completion = 3,189,646 tokens
+
+ model                                          req       prompt   completion    total tok
+ moonshotai/kimi-k3                             640       ...      ...           ...
+ z-ai/glm-5.3-flash                             310       ...      ...           ...
+--------------------------------------------------------------------------------------------------------------
+
  1) add key   2) remove key   3) enable/disable  4) refresh
  5) validate  6) test key     7) set pool_token  8) toggle pool fallback
- 0) quit
+ 9) catalog status            0) quit
 ```
 
 Non-interactive equivalents (for scripts):
@@ -153,7 +163,7 @@ Files (all auto-created):
 | Path | Purpose |
 |---|---|
 | `data/keys.json` | **Secrets.** Pool keys, `pool_token`, per-key labels/flags |
-| `data/state.json` | Cooldowns, per-key stats, dead-model cooldowns (atomic writes) |
+| `data/state.json` | Cooldowns, per-key stats, dead-model cooldowns, **usage telemetry** (tokens total/per-model/per-key), counters, proxy start time (atomic writes, flushed every 30 s) |
 | `data/proxy.json` | Server config |
 | `data/proxy.log` | Log (auto-rotates at 1 MB; keys are never written, only hash ids) |
 | `data/catalog.json` | Latest upstream model snapshot (written by the catalog watcher) |

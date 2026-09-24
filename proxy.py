@@ -238,6 +238,11 @@ class State:
         self.stats = {}           # key_id -> {"req": n, "ok": n, "429": n, "err": n}
         self.model_dead = {}      # model -> until_ts
         self.last_cycle_fail = 0.0
+        self.usage = {"total": {"req": 0, "prompt": 0, "completion": 0, "tokens": 0},
+                      "models": {}, "keys": {}}
+        self.counters = {"guard_rejected": 0, "stream_converted": 0,
+                         "fallback_used": 0, "client_aborts": 0}
+        self.started_at = 0.0
         self._last_save = 0.0
         self._load()
 
@@ -252,6 +257,11 @@ class State:
             self.last_used = {k: float(v) for k, v in st.get("last_used", {}).items()}
             self.model_dead = {k: float(v) for k, v in st.get("model_dead", {}).items()}
             self.stats = st.get("stats", {})
+            u = st.get("usage") or {}
+            self.usage = {"total": u.get("total") or {"req": 0, "prompt": 0, "completion": 0, "tokens": 0},
+                          "models": u.get("models") or {}, "keys": u.get("keys") or {}}
+            self.counters = st.get("counters") or self.counters
+            self.started_at = float(st.get("started_at") or 0.0)
         except Exception:
             pass
 
@@ -271,6 +281,9 @@ class State:
                             "last_used": self.last_used,
                             "model_dead": self.model_dead,
                             "stats": self.stats,
+                            "usage": self.usage,
+                            "counters": self.counters,
+                            "started_at": self.started_at,
                         },
                         f,
                         indent=1,
@@ -278,6 +291,43 @@ class State:
                 os.replace(tmp, STATE_FILE)
             except OSError:
                 pass
+
+    # ---- usage telemetry ----
+
+    def bump(self, name):
+        self.counters[name] = self.counters.get(name, 0) + 1
+        self.save()
+
+    def note_success(self, model, kid):
+        """Count one successful upstream completion (req counters only)."""
+        t = self.usage["total"]
+        t["req"] = t.get("req", 0) + 1
+        if model:
+            m = self.usage["models"].setdefault(model, {"req": 0, "prompt": 0, "completion": 0, "tokens": 0})
+            m["req"] = m.get("req", 0) + 1
+        k = self.usage["keys"].setdefault(kid, {"req": 0, "tokens": 0})
+        k["req"] = k.get("req", 0) + 1
+        self.save()
+
+    def add_tokens(self, model, kid, usage):
+        """Accumulate prompt/completion/total tokens from a NIM usage object."""
+        if not isinstance(usage, dict):
+            return
+        pt = int(usage.get("prompt_tokens") or 0)
+        ct = int(usage.get("completion_tokens") or 0)
+        tt = int(usage.get("total_tokens") or (pt + ct))
+        t = self.usage["total"]
+        t["prompt"] = t.get("prompt", 0) + pt
+        t["completion"] = t.get("completion", 0) + ct
+        t["tokens"] = t.get("tokens", 0) + tt
+        if model:
+            m = self.usage["models"].setdefault(model, {"req": 0, "prompt": 0, "completion": 0, "tokens": 0})
+            m["prompt"] = m.get("prompt", 0) + pt
+            m["completion"] = m.get("completion", 0) + ct
+            m["tokens"] = m.get("tokens", 0) + tt
+        k = self.usage["keys"].setdefault(kid, {"req": 0, "tokens": 0})
+        k["tokens"] = k.get("tokens", 0) + tt
+        self.save()
 
     def healthy(self, keys, model=None):
         """Return (key, keyid) pairs that are not cooling, LRU first."""
@@ -448,6 +498,14 @@ def catalog_loop():
         time.sleep(max(60, float(CFG.get("catalog_refresh_s") or 21600)))
 
 
+def state_flush_loop():
+    """Persist state (usage/counters) periodically so dashboards stay fresh
+    even after quiet periods (per-save writes are rate-limited to 2 s)."""
+    while True:
+        time.sleep(30)
+        STATE.save(force=True)
+
+
 # --------------------------------------------------------------------------
 # token estimation + context guard
 # --------------------------------------------------------------------------
@@ -481,6 +539,31 @@ def estimate_tokens(messages, tools=None):
             except Exception:
                 pass
     return int(chars / 2.8) + count * 8
+
+
+def _extract_usage(chunk):
+    """Pull the NIM usage object out of an SSE chunk (the final usage event is
+    the only one containing "total_tokens"). Returns a dict or None.
+    Never raises: chunk may be a partial read."""
+    if b'"total_tokens"' not in chunk:
+        return None
+    try:
+        text = chunk.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+            if payload and payload != "[DONE]":
+                try:
+                    obj = json.loads(payload)
+                except Exception:
+                    continue
+                u = obj.get("usage")
+                if isinstance(u, dict) and u.get("total_tokens") is not None:
+                    return u
+    return None
 
 
 def _status_class(status, detail=None):
@@ -661,6 +744,7 @@ class Handler(BaseHTTPRequestHandler):
         self._client_aborted = False
         self._convert_prelude_done = False
         self._convert_keepalive = None
+        self._abort_counted = False
 
         mode, byok_key = self._resolve_auth()
         if mode == "denied":
@@ -692,6 +776,12 @@ class Handler(BaseHTTPRequestHandler):
                     payload.pop("enable_thinking", None)
                     body = json.dumps(payload).encode("utf-8")
                     log("SCRUB | enable_thinking removed", request_id)
+                # enrich: request usage on native streams so token telemetry works
+                # (the extra usage chunk is standard OpenAI shape; safe for clients)
+                if want_stream and not converted_stream and not payload.get("stream_options"):
+                    payload["stream_options"] = {"include_usage": True}
+                    body = json.dumps(payload).encode("utf-8")
+                    log("ENRICH | stream_options.include_usage added for telemetry", request_id)
                 # scrub invalid max_tokens (clients compute negatives from stale windows)
                 mt = payload.get("max_tokens")
                 if isinstance(mt, (int, float)) and mt < 1:
@@ -704,6 +794,7 @@ class Handler(BaseHTTPRequestHandler):
                 cap = int(ctx * CFG["guard_ratio"])
                 if est > cap:
                     log("GUARD | model=%s est=%d cap=%d -> rejected" % (model, est, cap), request_id)
+                    STATE.bump("guard_rejected")
                     self._send_json(400, {"error": {"message": (
                         "[nim-rotator-proxy] context guard: ~%d estimated tokens exceed "
                         "%.0f%% of %d context for '%s'. Reduce the conversation."
@@ -716,6 +807,7 @@ class Handler(BaseHTTPRequestHandler):
             payload.pop("stream_options", None)
             body = json.dumps(payload).encode("utf-8")
             converted_stream = True
+            STATE.bump("stream_converted")
             log("STREAM_CONVERT | est=%d >= %d -> buffered upstream + SSE emulation"
                 % (est, BIG_CTX_BUFFERED_MIN_TOKENS), request_id)
 
@@ -766,6 +858,8 @@ class Handler(BaseHTTPRequestHandler):
             saw_410 = False
             last_status = None
             fallback_headers = {"X-Nim-Proxy-Model-Fallback": cand} if is_fallback else None
+            if is_fallback:
+                STATE.bump("fallback_used")
 
             attempt_keys = healthy[:MAX_STREAM_KEYS] if (want_stream and MAX_STREAM_KEYS > 0) else healthy
 
@@ -850,16 +944,17 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         if status == 200 and want_stream and not converted_stream:
                             stream_result = self._pipe_stream(
-                                resp, model=cand, is_last=(pos + 1 >= len(attempt_keys)),
+                                resp, model=cand, kid=kid, is_last=(pos + 1 >= len(attempt_keys)),
                                 extra_headers=fallback_headers)
                         elif status == 200 and converted_stream:
                             self._stop_convert_keepalive()
                             stream_result = self._emulate_sse(
-                                resp, model=cand, is_last=(pos + 1 >= len(attempt_keys)),
+                                resp, model=cand, kid=kid, is_last=(pos + 1 >= len(attempt_keys)),
                                 extra_headers=fallback_headers,
                                 headers_sent=self._convert_prelude_done)
                         else:
-                            detail_preview = self._pipe_buffered(resp, extra_headers=fallback_headers)
+                            detail_preview = self._pipe_buffered(resp, extra_headers=fallback_headers,
+                                                                 model=cand, kid=kid)
                     except CLIENT_ABORT_ERRORS:
                         self._client_aborted = True
                         pass
@@ -870,13 +965,18 @@ class Handler(BaseHTTPRequestHandler):
                         log("RELAYERR | key#%s | %s | class=%s" % (kid, type(e).__name__, error_class), request_id)
                         relay_failed = True
 
-                    STATE.note_ok(kid) if (status == 200 and not relay_failed) else None
+                    if status == 200 and not relay_failed and not self._client_aborted:
+                        STATE.note_ok(kid)
+                        STATE.note_success(cand, kid)
 
                     if detail_preview:
                         log("UPSTREAM_DETAIL | status=%d | class=%s | preview=%s"
                             % (status, _status_class(status, detail_preview), detail_preview), request_id)
                     if self._client_aborted:
                         log("CLIENT_ABORT | key#%s | class=client_abort" % kid, request_id)
+                        if not getattr(self, "_abort_counted", False):
+                            self._abort_counted = True
+                            STATE.bump("client_aborts")
 
                     if stream_result == "retry" and pos + 1 < len(attempt_keys):
                         log("STREAMRETRY | key#%s | model=%s -> trying next key | class=upstream_5xx"
@@ -992,7 +1092,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             self._convert_keepalive = None
 
-    def _emulate_sse(self, upstream_resp, model=None, is_last=True, extra_headers=None, headers_sent=False):
+    def _emulate_sse(self, upstream_resp, model=None, kid=None, is_last=True, extra_headers=None, headers_sent=False):
         """Replay a buffered upstream JSON response as OpenAI-style SSE deltas.
 
         Returns "ok" (replayed or error relayed) or "aborted" (client gone)."""
@@ -1152,6 +1252,9 @@ class Handler(BaseHTTPRequestHandler):
         env["created"] = obj.get("created") or env["created"]
         env["model"] = obj.get("model") or env["model"]
 
+        if model:
+            STATE.add_tokens(model, kid, obj.get("usage"))
+
         choices = obj.get("choices") or [{}]
         ch0 = choices[0] if choices else {}
         msg = ch0.get("message") or {}
@@ -1203,7 +1306,7 @@ class Handler(BaseHTTPRequestHandler):
             % (len(content), finish, len(reasoning), json.dumps(tools_dbg)), rid)
         return "ok"
 
-    def _pipe_stream(self, upstream_resp, model=None, is_last=True, extra_headers=None):
+    def _pipe_stream(self, upstream_resp, model=None, kid=None, is_last=True, extra_headers=None):
         """Forward an SSE/chunked upstream body using chunked TE.
         Returns "ok", "retry" (nothing sent yet) or "aborted"."""
 
@@ -1332,6 +1435,7 @@ class Handler(BaseHTTPRequestHandler):
             data_chunks = 0
             keepalive_count = 0
             consecutive_idles = 0
+            usage_seen = False
             MAX_CONSECUTIVE_IDLES = 40  # 40 * keepalive_s total silence
 
             if peek_buf:
@@ -1339,6 +1443,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 data_bytes += len(peek_buf)
                 data_chunks += 1
+                if model:
+                    u = _extract_usage(peek_buf)
+                    if u:
+                        usage_seen = True
+                        STATE.add_tokens(model, kid, u)
 
             while True:
                 reset_raw_timeout()
@@ -1414,6 +1523,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 data_bytes += len(chunk)
                 data_chunks += 1
+                if model and not usage_seen:
+                    u = _extract_usage(chunk)
+                    if u:
+                        usage_seen = True
+                        STATE.add_tokens(model, kid, u)
 
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
@@ -1424,8 +1538,15 @@ class Handler(BaseHTTPRequestHandler):
             self._client_aborted = True
             return "aborted"
 
-    def _pipe_buffered(self, upstream_resp, extra_headers=None):
+    def _pipe_buffered(self, upstream_resp, extra_headers=None, model=None, kid=None):
         body = upstream_resp.read()
+        if model and 200 <= upstream_resp.status <= 299:
+            try:
+                u = (json.loads(body.decode("utf-8", errors="replace")) or {}).get("usage")
+                if isinstance(u, dict):
+                    STATE.add_tokens(model, kid, u)
+            except Exception:
+                pass
         detail = ""
         if not 200 <= upstream_resp.status <= 299:
             detail = _error_detail_preview(body, getattr(self, "_active_request_secrets", ()))
@@ -1479,6 +1600,9 @@ def main():
     srv.daemon_threads = True
     if CFG.get("catalog_enabled"):
         threading.Thread(target=catalog_loop, daemon=True).start()
+    threading.Thread(target=state_flush_loop, daemon=True).start()
+    STATE.started_at = time.time()
+    STATE.save(force=True)
     pool_n = len(load_pool_keys())
     log("START | %s:%d | version=%s | pool_keys=%d" % (host, port, __version__, pool_n))
     print("nim-rotator-proxy v%s listening on http://%s:%d" % (__version__, host, port))

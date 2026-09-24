@@ -134,35 +134,87 @@ def status_of(entry, state):
     cool = (state.get("key_cool") or {}).get(kid, 0)
     now = time.time()
     if cool > now:
+        if cool - now > 23 * 3600:
+            return c("REVOKED", RED)
         return c("cooling %dm" % int((cool - now) / 60), YELLOW)
-    if cool > now - 86400 and cool != 0 and (cool - now) < -86000:
-        return c("revoked?", RED)
     return c("ok", GREEN)
+
+
+def fmt(n):
+    return "{:,}".format(int(n or 0))
 
 
 def table(doc, state):
     keys = doc.get("keys") or []
+    usage_keys = ((state.get("usage") or {}).get("keys")) or {}
     print()
     print(c(" nim-rotator-proxy keys — %s" % KEYS_FILE, BOLD))
-    print(dim_text(" " + "-" * 78))
-    print(" %-10s %-18s %-11s %-8s %-6s %-6s %-6s" % ("id", "key", "label", "status", "req", "ok", "429"))
+    print(dim_text(" " + "-" * 88))
+    print(" %-10s %-16s %-11s %-11s %-6s %-6s %-6s %-10s" % (
+        "id", "key", "label", "status", "req", "ok", "429", "tokens"))
     if not keys:
         print(dim_text(" (empty — add your first NVIDIA NIM key with 'add')"))
     stats = state.get("stats") or {}
     for e in keys:
         s = (stats.get(e["id"]) or {})
-        print(" %-10s %-18s %-11s %-8s %-6s %-6s %-6s" % (
+        u = (usage_keys.get(e["id"]) or {})
+        print(" %-10s %-16s %-11s %-11s %-6s %-6s %-6s %-10s" % (
             e["id"], mask(e["key"]), (e.get("label") or "")[:11],
-            status_of(e, state), s.get("req", 0), s.get("ok", 0), s.get("429", 0)))
-    print(dim_text(" " + "-" * 78))
+            status_of(e, state), s.get("req", 0), s.get("ok", 0), s.get("429", 0), fmt(u.get("tokens", 0))))
+    print(dim_text(" " + "-" * 88))
     pt = doc.get("pool_token") or "(none — pool only open to localhost)"
     print(" pool_token : %s" % (c(pt[:6] + "..." if doc.get("pool_token") else pt, CYAN)))
     print(" pool fallback for BYOK 429s: %s" % (c("ON", GREEN) if doc.get("allow_pool_fallback") else c("OFF", DIM)))
     print()
 
 
+def usage_panel(state):
+    """Token usage (total + per model), counters, dead models, uptime."""
+    usage = state.get("usage") or {}
+    total = usage.get("total") or {}
+    if not total.get("req"):
+        return
+    started = float(state.get("started_at") or 0)
+    up = time.time() - started if started else 0
+    print(c(" usage since proxy start%s" % (" — uptime %dh%02dm" % (up // 3600, (up % 3600) // 60) if up else ""), BOLD))
+    print(dim_text(" " + "-" * 88))
+    print(" total: %s completions | %s prompt + %s completion = %s tokens" % (
+        c(fmt(total.get("req")), CYAN), fmt(total.get("prompt")),
+        fmt(total.get("completion")), c(fmt(total.get("tokens")), CYAN)))
+    models = usage.get("models") or {}
+    if models:
+        print()
+        print(" %-46s %7s %12s %12s %12s" % ("model", "req", "prompt", "completion", "total tok"))
+        for m, u in sorted(models.items(), key=lambda kv: -kv[1].get("tokens", 0))[:15]:
+            print(" %-46s %7s %12s %12s %12s" % (
+                m[:46], u.get("req", 0), fmt(u.get("prompt", 0)),
+                fmt(u.get("completion", 0)), fmt(u.get("tokens", 0))))
+        if len(models) > 15:
+            print(dim_text(" ... %d more models" % (len(models) - 15)))
+    counters = state.get("counters") or {}
+    extras = []
+    for label, keyv in (("guard rejections", "guard_rejected"),
+                        ("stream conversions", "stream_converted"),
+                        ("model fallbacks", "fallback_used"),
+                        ("client aborts", "client_aborts")):
+        if counters.get(keyv):
+            extras.append("%s: %s" % (label, counters[keyv]))
+    dead = {m: int((v - time.time()) / 60) for m, v in (state.get("model_dead") or {}).items() if v > time.time()}
+    if extras or dead:
+        print()
+        if extras:
+            print(" " + " | ".join(extras))
+        if dead:
+            print(" " + c("cooling (removed/dead): ", RED) + ", ".join(
+                "%s (%dm)" % (m, t) for m, t in sorted(dead.items())))
+    print(dim_text(" " + "-" * 88))
+    print()
+
+
 def cmd_list():
-    table(load(), load_state())
+    state = load_state()
+    table(load(), state)
+    usage_panel(state)
 
 
 def find_entry(doc, prefix):
@@ -292,6 +344,7 @@ def dashboard():
     while True:
         doc, state = load(), load_state()
         table(doc, state)
+        usage_panel(state)
         choice = input(c("choice> ", CYAN)).strip()
         if choice == "1":
             lbl = input("label (optional): ").strip() or None
