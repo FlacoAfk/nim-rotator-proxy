@@ -776,6 +776,18 @@ class Handler(BaseHTTPRequestHandler):
                     payload.pop("enable_thinking", None)
                     body = json.dumps(payload).encode("utf-8")
                     log("SCRUB | enable_thinking removed", request_id)
+                # clients' thought toggles send a `reasoning` object — NIM
+                # rejects it with 400 "Unsupported parameter(s)". Map
+                # effort-style payloads to reasoning_effort; otherwise drop it
+                # (NIM models control reasoning via their own defaults).
+                rsn = payload.pop("reasoning", None)
+                if isinstance(rsn, dict):
+                    eff = rsn.get("effort")
+                    if eff and not payload.get("reasoning_effort"):
+                        payload["reasoning_effort"] = str(eff)
+                    body = json.dumps(payload).encode("utf-8")
+                    log("SCRUB | reasoning object removed (NIM rejects it)%s"
+                        % ("; effort -> reasoning_effort" if eff else ""), request_id)
                 # enrich: request usage on native streams so token telemetry works
                 # (the extra usage chunk is standard OpenAI shape; safe for clients)
                 if want_stream and not converted_stream and not payload.get("stream_options"):
@@ -1421,6 +1433,30 @@ class Handler(BaseHTTPRequestHandler):
             if first_is_error:
                 log("STREAMRETRY | first event is upstream error envelope, no keys left -> relaying",
                     getattr(self, "_active_request_id", None))
+
+            # Degenerate-reasoning detection: degraded NIM workers sometimes
+            # emit a single repeated character (e.g. "!!!!!") as reasoning.
+            # Nothing has been sent to the client yet, so retry another key.
+            if not first_is_error and peek_buf:
+                try:
+                    rsn_chars = re.findall(rb'"reasoning_content":"(.)"', peek_buf)
+                    if len(rsn_chars) >= 20:
+                        best = runs = 1
+                        for i in range(1, len(rsn_chars)):
+                            if rsn_chars[i] == rsn_chars[i - 1]:
+                                runs += 1
+                                if runs > best:
+                                    best = runs
+                            else:
+                                runs = 1
+                        if best >= 20:
+                            log("STREAMRETRY | degenerate reasoning (%dx same char in peek) -> %s"
+                                % (best, "retrying next key" if not is_last else "relaying (last key)"),
+                                getattr(self, "_active_request_id", None))
+                            if not is_last:
+                                return "retry"
+                except Exception:
+                    pass
 
             self.send_response(upstream_resp.status)
             for hk, hv in (extra_headers or {}).items():
