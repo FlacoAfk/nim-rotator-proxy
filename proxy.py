@@ -776,6 +776,12 @@ class Handler(BaseHTTPRequestHandler):
                     payload.pop("enable_thinking", None)
                     body = json.dumps(payload).encode("utf-8")
                     log("SCRUB | enable_thinking removed", request_id)
+                # the bare `thinking` toggle is model-dependent: silently ignored
+                # by some models (glm), hard 400 on others (laguna) — never useful.
+                if "thinking" in payload:
+                    payload.pop("thinking", None)
+                    body = json.dumps(payload).encode("utf-8")
+                    log("SCRUB | thinking removed (model-dependent 400)", request_id)
                 # clients' thought toggles send a `reasoning` object — NIM
                 # rejects it with 400 "Unsupported parameter(s)". Map
                 # effort-style payloads to reasoning_effort; otherwise drop it
