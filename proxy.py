@@ -67,6 +67,8 @@ DEFAULT_CONFIG = {
     "buffered_min_tokens": 150000, # est prefill at which stream->buffered kicks in
     "keepalive_s": 15.0,
     "ttfb_timeout_s": 300.0,
+    "ttfb_timeout_small_s": 150.0,   # small prompts should never wait 300s for a first byte
+    "ttfb_retry_s": 90.0,            # after one key timed out, fail the next ones faster
     "upstream_timeout_s": 600.0,
     "default_context": 131072,     # guard ceiling for models missing from limits
     "guard_ratio": 0.9,
@@ -933,6 +935,12 @@ class Handler(BaseHTTPRequestHandler):
                         % (est, CFG["guard_ratio"] * 100, ctx, model))}})
                     return
 
+        # ---- per-request TTFB budget: small prompts fail fast, big ones wait ----
+        if want_stream and payload is not None:
+            self._ttfb_budget = CFG["ttfb_timeout_small_s"] if est < 10000 else CFG["ttfb_timeout_s"]
+        else:
+            self._ttfb_budget = CFG["ttfb_timeout_s"]
+
         # ---- big-context streaming conversion ----
         if want_stream and payload is not None and est >= BIG_CTX_BUFFERED_MIN_TOKENS:
             payload["stream"] = False
@@ -1018,7 +1026,12 @@ class Handler(BaseHTTPRequestHandler):
                 t0 = time.monotonic()
                 self._active_request_secrets = (upkey,)
                 try:
-                    conn = http.client.HTTPSConnection(UPSTREAM_HOST, timeout=UPSTREAM_TIMEOUT_S)
+                    # bound connection wait: small streaming prompts fail fast
+                    # (NIM hangs can hold response headers for minutes)
+                    conn_timeout = UPSTREAM_TIMEOUT_S
+                    if want_stream and payload is not None and est < 10000:
+                        conn_timeout = min(UPSTREAM_TIMEOUT_S, self._ttfb_budget if pos == 0 else CFG.get("ttfb_retry_s", 90.0))
+                    conn = http.client.HTTPSConnection(UPSTREAM_HOST, timeout=conn_timeout)
                     hdrs = {
                         "Content-Type": self.headers.get("Content-Type", "application/json"),
                         "Accept": "application/json",
@@ -1077,6 +1090,7 @@ class Handler(BaseHTTPRequestHandler):
                     stream_result = "ok"
                     try:
                         if status == 200 and want_stream and not converted_stream:
+                            self._ttfb_key_attempt = pos
                             stream_result = self._pipe_stream(
                                 resp, model=cand, kid=kid, is_last=(pos + 1 >= len(attempt_keys)),
                                 extra_headers=fallback_headers,
@@ -1475,14 +1489,17 @@ class Handler(BaseHTTPRequestHandler):
                 if upstream_raw is not None and hasattr(upstream_raw, "_timeout_occurred"):
                     upstream_raw._timeout_occurred = False
 
-            # ---- first-chunk peek (nothing sent to the client yet) ----
+            # ---- first-chunk peek (only the prelude may be sent) ----
+            # Budget: per-request (small prompts get a shorter cap); keys after
+            # the first timeout use ttfb_retry_s — one hung key predicts the rest.
+            budget = CFG.get("ttfb_retry_s", 90.0) if getattr(self, "_ttfb_key_attempt", 0) > 0 else getattr(self, "_ttfb_budget", FIRST_BYTE_TIMEOUT_S)
             peek_buf = b""
             t_start = time.monotonic()
             while True:
                 reset_raw_timeout()
                 readable = _wait_readable(active_sock, 1.0)
                 if not readable:
-                    if time.monotonic() - t_start >= FIRST_BYTE_TIMEOUT_S:
+                    if time.monotonic() - t_start >= budget:
                         if is_last:
                             if headers_sent:
                                 self._send_sse_error_envelope(504, "[nim-rotator-proxy] upstream timed out waiting for first byte (TTFB)")
@@ -1497,7 +1514,7 @@ class Handler(BaseHTTPRequestHandler):
                     chunk = upstream_resp.read1(8192)
                 except (socket.timeout, TimeoutError):
                     reset_raw_timeout()
-                    if time.monotonic() - t_start >= FIRST_BYTE_TIMEOUT_S:
+                    if time.monotonic() - t_start >= budget:
                         if is_last:
                             if headers_sent:
                                 self._send_sse_error_envelope(504, "[nim-rotator-proxy] upstream timed out waiting for first byte (TTFB)")
