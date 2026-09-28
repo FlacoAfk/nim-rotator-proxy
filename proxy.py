@@ -42,7 +42,7 @@ import threading
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("NIM_PROXY_DATA_DIR", os.path.join(BASE_DIR, "data"))
@@ -75,6 +75,7 @@ DEFAULT_CONFIG = {
     "catalog_enabled": True,       # watch NIM's /v1/models for added/removed models
     "catalog_refresh_s": 21600,    # 6 h between catalog checks (single cheap GET)
     "catalog_poll_key_id": "",     # optional explicit key id used for polling
+    "max_rpm": 28,                 # adaptive per-key RPM ceiling (NIM limit ~40)
 }
 
 KEY_COOLDOWN_S = 300
@@ -245,6 +246,24 @@ class State:
         self.started_at = 0.0
         self._last_save = 0.0
         self._load()
+        # adaptive RPM (in-memory; idea: openvidia) — sliding 60s window per
+        # key + per-key ceiling that halves on 429 and rehabs on success
+        self.rpm_win = {}
+        self.rpm_ceil = {}
+
+    # ---- adaptive RPM ----
+
+    def rpm_now(self, kid):
+        now = time.time()
+        win = [t for t in self.rpm_win.get(kid, []) if now - t < 60.0]
+        self.rpm_win[kid] = win
+        return len(win)
+
+    def rpm_ceiling(self, kid):
+        return float(self.rpm_ceil.get(kid, CFG.get("max_rpm", 28)))
+
+    def note_request(self, kid):
+        self.rpm_win.setdefault(kid, []).append(time.time())
 
     def _load(self):
         try:
@@ -298,13 +317,17 @@ class State:
         self.counters[name] = self.counters.get(name, 0) + 1
         self.save()
 
-    def note_success(self, model, kid):
-        """Count one successful upstream completion (req counters only)."""
+    def note_success(self, model, kid, seconds=None):
+        """Count one successful upstream completion + rolling latency."""
         t = self.usage["total"]
         t["req"] = t.get("req", 0) + 1
         if model:
-            m = self.usage["models"].setdefault(model, {"req": 0, "prompt": 0, "completion": 0, "tokens": 0})
+            m = self.usage["models"].setdefault(
+                model, {"req": 0, "prompt": 0, "completion": 0, "tokens": 0, "lat_sum": 0.0, "lat_n": 0})
             m["req"] = m.get("req", 0) + 1
+            if seconds:
+                m["lat_sum"] = round(m.get("lat_sum", 0.0) + seconds, 2)
+                m["lat_n"] = m.get("lat_n", 0) + 1
         k = self.usage["keys"].setdefault(kid, {"req": 0, "tokens": 0})
         k["req"] = k.get("req", 0) + 1
         self.save()
@@ -330,7 +353,10 @@ class State:
         self.save()
 
     def healthy(self, keys, model=None):
-        """Return (key, keyid) pairs that are not cooling, LRU first."""
+        """Return (key, keyid) pairs that are not cooling, LRU first.
+
+        Keys whose adaptive RPM window is at their ceiling are held back
+        unless every healthy key is saturated (then order by headroom)."""
         now = time.time()
         out = []
         for k in keys:
@@ -340,6 +366,10 @@ class State:
                     continue
                 out.append((k, kid))
         out.sort(key=lambda kv: self.last_used.get(kv[1], 0))
+        fresh = [(k, kid) for k, kid in out if self.rpm_now(kid) < self.rpm_ceiling(kid)]
+        if fresh:
+            return fresh
+        out.sort(key=lambda kv: self.rpm_ceiling(kv[1]) - self.rpm_now(kv[1]), reverse=True)
         return out
 
     def note_use(self, kid):
@@ -356,6 +386,7 @@ class State:
         self.key_cool[kid] = now + KEY_COOLDOWN_S
         if model:
             self.model_key_cool[(model, kid)] = now + MODEL_KEY_COOLDOWN_S
+        self.rpm_ceil[kid] = max(14.0, self.rpm_ceiling(kid) / 2.0)
         self.note_result(kid, "429")
         self.save(force=True)
 
@@ -366,6 +397,9 @@ class State:
 
     def note_ok(self, kid):
         self.note_result(kid, "ok")
+        ceil = self.rpm_ceiling(kid)
+        if ceil < CFG.get("max_rpm", 28):
+            self.rpm_ceil[kid] = min(float(CFG.get("max_rpm", 28)), ceil + 10.0)
         self.save()
 
     def note_model_dead(self, model, seconds):
@@ -717,6 +751,86 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"error": {"message": "not found"}})
 
+    def _tail_log(self, n=15):
+        try:
+            with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+                return [l.rstrip() for l in f.readlines()[-n:]]
+        except OSError:
+            return []
+
+    def _status_snapshot(self):
+        doc = load_keys_doc()
+        state = STATE
+        now = time.time()
+        keys_out = []
+        for e in (doc.get("keys") or []):
+            kid = e.get("id")
+            cool = state.key_cool.get(kid, 0)
+            if not e.get("enabled", True):
+                status = "disabled"
+            elif cool > now:
+                status = "REVOKED" if cool - now > 23 * 3600 else "cooling"
+            else:
+                status = "ok"
+            s = state.stats.get(kid, {})
+            u = state.usage.get("keys", {}).get(kid, {})
+            keys_out.append({
+                "id": kid, "label": e.get("label"), "status": status,
+                "rpm": state.rpm_now(kid), "rpm_ceiling": round(state.rpm_ceiling(kid), 1),
+                "req": s.get("req", 0), "ok": s.get("ok", 0), "429": s.get("429", 0),
+                "tokens": u.get("tokens", 0),
+            })
+        up = now - state.started_at if state.started_at else 0
+        return {
+            "service": "nim-rotator-proxy", "version": __version__,
+            "host": CFG["host"], "port": CFG["port"], "uptime_s": int(up),
+            "pool_token_set": bool(doc.get("pool_token")),
+            "allow_pool_fallback": bool(doc.get("allow_pool_fallback")),
+            "keys": keys_out,
+            "usage": state.usage, "counters": state.counters,
+            "catalog": dict(CATALOG_STATUS),
+            "activity": self._tail_log(15),
+            "models_window": len(load_limits()),
+        }
+
+    def do_GET(self):
+        if self.path in ("/health", "/healthz"):
+            pool = load_pool_keys()
+            cs = dict(CATALOG_STATUS)
+            cs["next_check_in_s"] = max(0, int(
+                (60 if not cs["last_check"] else
+                 cs["last_check"] + max(60, float(CFG.get("catalog_refresh_s") or 21600)))
+                - time.time())) if cs.get("enabled") else None
+            self._send_json(200, {
+                "ok": True,
+                "service": "nim-rotator-proxy",
+                "version": __version__,
+                "pool_keys": len(pool),
+                "host": CFG["host"],
+                "port": CFG["port"],
+                "catalog": cs,
+            })
+            return
+        if self.path == "/status":
+            mode, _ = self._resolve_auth()
+            if mode == "denied" and not self._is_local():
+                self._send_json(401, {"error": {"message": "unauthorized"}})
+                return
+            self._send_json(200, self._status_snapshot())
+            return
+        if self.path == "/dashboard":
+            body = DASHBOARD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith("/v1/"):
+            self._proxy("GET", self.path, None)
+            return
+        self._send_json(404, {"error": {"message": "not found"}})
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
@@ -900,6 +1014,7 @@ class Handler(BaseHTTPRequestHandler):
                     log("CLIENT_ABORT | convert prelude", request_id)
                     return
             for pos, (upkey, kid) in enumerate(attempt_keys):
+                STATE.note_request(kid)
                 t0 = time.monotonic()
                 self._active_request_secrets = (upkey,)
                 try:
@@ -987,7 +1102,7 @@ class Handler(BaseHTTPRequestHandler):
 
                     if status == 200 and not relay_failed and not self._client_aborted:
                         STATE.note_ok(kid)
-                        STATE.note_success(cand, kid)
+                        STATE.note_success(cand, kid, (time.monotonic() - t0))
 
                     if detail_preview:
                         log("UPSTREAM_DETAIL | status=%d | class=%s | preview=%s"
@@ -1626,6 +1741,93 @@ class Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# web dashboard (served at /dashboard; no external assets)
+# --------------------------------------------------------------------------
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en" data-theme="dark"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nim-rotator-proxy — dashboard</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--edge:#30363d;--fg:#e6edf3;--dim:#8b949e;
+--ok:#3fb950;--warn:#d29922;--err:#f85149;--acc:#58a6ff}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.45 ui-sans-serif,system-ui,Segoe UI,Roboto;margin:0;padding:18px}
+h1{font-size:18px;display:flex;gap:10px;align-items:center}
+h1 .v{color:var(--dim);font-weight:400;font-size:13px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));margin-top:14px}
+.card{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:14px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:10px}
+.kv{display:flex;gap:16px;flex-wrap:wrap}
+.kv .stat{min-width:110px}.kv .stat b{display:block;font-size:20px}.kv .stat span{color:var(--dim);font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--dim);text-align:left;font-weight:500;padding:4px 6px;border-bottom:1px solid var(--edge)}
+td{padding:4px 6px;border-bottom:1px solid #21262d}
+.st-ok{color:var(--ok)}.st-cooling{color:var(--warn)}.st-REVOKED{color:var(--err)}.st-disabled{color:var(--dim)}
+.bar{height:4px;background:#21262d;border-radius:2px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc)}
+#activity{font:12px/1.6 ui-monospace,Consolas,monospace;color:var(--dim);white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto}
+.head{display:flex;justify-content:space-between;align-items:baseline}
+.sub{color:var(--dim);font-size:12px}
+</style></head><body>
+<h1>nim-rotator-proxy <span class="v" id="ver"></span>
+ <span class="v" id="uptime"></span></h1>
+<div class="sub" id="conn">connecting…</div>
+<div class="grid">
+ <div class="card"><h2>Totals</h2><div class="kv" id="totals"></div></div>
+ <div class="card"><h2>Counters</h2><div class="kv" id="counters"></div></div>
+ <div class="card" style="grid-column:1/-1"><h2>API keys</h2>
+  <table id="keys"><thead><tr><th>id</th><th>label</th><th>status</th><th>RPM / ceiling</th><th>req</th><th>ok</th><th>429</th><th>tokens</th></tr></thead><tbody></tbody></table>
+  <div class="sub" id="poolnote" style="margin-top:8px"></div></div>
+ <div class="card" style="grid-column:1/-1"><h2>Models (usage + latency)</h2>
+  <table id="models"><thead><tr><th>model</th><th>req</th><th>prompt</th><th>completion</th><th>tokens</th><th>avg latency</th><th>~tok/s</th></tr></thead><tbody></tbody></table></div>
+ <div class="card" style="grid-column:1/-1"><h2>Catalog watcher</h2><div id="catalog" class="sub"></div></div>
+ <div class="card" style="grid-column:1/-1"><h2>Activity (proxy log tail)</h2><div id="activity"></div></div>
+</div>
+<script>
+const fmt=n=>Number(n||0).toLocaleString('en-US');
+async function refresh(){
+ try{
+  const s=await (await fetch('/status')).json();
+  document.getElementById('ver').textContent='v'+s.version;
+  const up=s.uptime_s||0, h=Math.floor(up/3600), m=Math.floor(up%3600/60);
+  document.getElementById('uptime').textContent='up '+h+'h '+m+'m · '+s.host+':'+s.port;
+  document.getElementById('conn').textContent='live · refreshed '+new Date().toLocaleTimeString();
+  const t=s.usage.total||{};
+  document.getElementById('totals').innerHTML=
+   '<div class="stat"><b>'+fmt(t.req)+'</b><span>completions</span></div>'+
+   '<div class="stat"><b>'+fmt(t.prompt)+'</b><span>prompt tok</span></div>'+
+   '<div class="stat"><b>'+fmt(t.completion)+'</b><span>completion tok</span></div>'+
+   '<div class="stat"><b>'+fmt(t.tokens)+'</b><span>total tokens</span></div>'+
+   '<div class="stat"><b>'+s.keys.length+'</b><span>pool keys</span></div>';
+  const c=s.counters||{}, names={guard_rejected:'guard rejections',stream_converted:'stream conversions',fallback_used:'model fallbacks',client_aborts:'client aborts'};
+  document.getElementById('counters').innerHTML=Object.keys(names).map(k=>
+   '<div class="stat"><b>'+fmt(c[k])+'</b><span>'+names[k]+'</span></div>').join('');
+  document.querySelector('#keys tbody').innerHTML=(s.keys||[]).map(k=>{
+   const cls='st-'+(k.status||'ok');
+   const pct=Math.min(100,100*k.rpm/(k.rpm_ceiling||1));
+   return '<tr><td>'+k.id+'</td><td>'+(k.label||'')+'</td><td class="'+cls+'">'+k.status+'</td>'+
+    '<td><div class="bar"><i style="width:'+pct+'%"></i></div> '+k.rpm+' / '+k.rpm_ceiling+'</td>'+
+    '<td>'+fmt(k.req)+'</td><td>'+fmt(k.ok)+'</td><td>'+fmt(k['429'])+'</td><td>'+fmt(k.tokens)+'</td></tr>'}).join('');
+  document.getElementById('poolnote').textContent='pool_token: '+(s.pool_token_set?'set':'not set (localhost only)')+' · BYOK pool fallback: '+(s.allow_pool_fallback?'ON':'OFF');
+  const ms=Object.entries(s.usage.models||{}).sort((a,b)=>b[1].tokens-a[1].tokens);
+  document.querySelector('#models tbody').innerHTML=ms.map(([m,u])=>{
+   const lat=u.lat_n?u.lat_sum/u.lat_n:null, tps=lat?(u.completion/lat).toFixed(1):'—';
+   return '<tr><td>'+m+'</td><td>'+fmt(u.req)+'</td><td>'+fmt(u.prompt)+'</td><td>'+fmt(u.completion)+'</td><td>'+fmt(u.tokens)+'</td><td>'+(lat?lat.toFixed(1)+'s':'—')+'</td><td>'+tps+'</td></tr>'}).join('')
+   || '<tr><td colspan="7" style="color:var(--dim)">no traffic yet</td></tr>';
+  const cat=s.catalog||{};
+  document.getElementById('catalog').innerHTML=
+   'models: <b>'+cat.models+'</b> · last check: '+(cat.last_check?new Date(cat.last_check*1000).toLocaleString():'pending')+
+   '<br>added: '+(cat.added&&cat.added.length?cat.added.join(', '):'—')+
+   '<br>removed: '+(cat.removed&&cat.removed.length?cat.removed.join(', '):'—')+
+   (cat.last_error?'<br><span style="color:var(--err)">'+cat.last_error+'</span>':'');
+  document.getElementById('activity').textContent=(s.activity||[]).join('\n');
+ }catch(e){document.getElementById('conn').textContent='status unavailable: '+e}
+}
+refresh();setInterval(refresh,3000);
+</script></body></html>"""
+
 
 def main():
     argv = [a for a in sys.argv[1:]]
