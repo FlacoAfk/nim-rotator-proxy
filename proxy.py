@@ -1822,7 +1822,7 @@ async function refresh(){
    '<br>added: '+(cat.added&&cat.added.length?cat.added.join(', '):'—')+
    '<br>removed: '+(cat.removed&&cat.removed.length?cat.removed.join(', '):'—')+
    (cat.last_error?'<br><span style="color:var(--err)">'+cat.last_error+'</span>':'');
-  document.getElementById('activity').textContent=(s.activity||[]).join('\n');
+  document.getElementById('activity').textContent=(s.activity||[]).join(String.fromCharCode(10));
  }catch(e){document.getElementById('conn').textContent='status unavailable: '+e}
 }
 refresh();setInterval(refresh,3000);
