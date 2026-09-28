@@ -881,11 +881,12 @@ class Handler(BaseHTTPRequestHandler):
 
             attempt_keys = healthy[:MAX_STREAM_KEYS] if (want_stream and MAX_STREAM_KEYS > 0) else healthy
 
-            if converted_stream and not getattr(self, "_convert_prelude_done", False):
-                # NIM holds HTTP headers for buffered responses until compute
-                # finishes; clients with ~60s TTFB limits abort long before.
-                # Ship the SSE prelude now and keep the stream warm from a
-                # side thread while upstream (and any key retries) run.
+            if want_stream and payload is not None and not getattr(self, "_convert_prelude_done", False):
+                # Client headers must go out IMMEDIATELY for every stream:
+                # NIM can take minutes before the first byte (degraded workers,
+                # key-retry chains), and clients abort on silent headers
+                # (~300s undici limit). Prelude + keepalive thread keep the
+                # stream warm across the whole key-retry chain.
                 try:
                     self._send_convert_prelude(fallback_headers, model=cand)
                     keep_stop = threading.Event()
@@ -963,7 +964,8 @@ class Handler(BaseHTTPRequestHandler):
                         if status == 200 and want_stream and not converted_stream:
                             stream_result = self._pipe_stream(
                                 resp, model=cand, kid=kid, is_last=(pos + 1 >= len(attempt_keys)),
-                                extra_headers=fallback_headers)
+                                extra_headers=fallback_headers,
+                                headers_sent=self._convert_prelude_done)
                         elif status == 200 and converted_stream:
                             self._stop_convert_keepalive()
                             stream_result = self._emulate_sse(
@@ -1324,9 +1326,10 @@ class Handler(BaseHTTPRequestHandler):
             % (len(content), finish, len(reasoning), json.dumps(tools_dbg)), rid)
         return "ok"
 
-    def _pipe_stream(self, upstream_resp, model=None, kid=None, is_last=True, extra_headers=None):
+    def _pipe_stream(self, upstream_resp, model=None, kid=None, is_last=True, extra_headers=None, headers_sent=False):
         """Forward an SSE/chunked upstream body using chunked TE.
-        Returns "ok", "retry" (nothing sent yet) or "aborted"."""
+        Returns "ok", "retry" (nothing but the optional prelude was sent) or
+        "aborted"."""
 
         def send_chunk(payload):
             self.wfile.write(("%x\r\n" % len(payload)).encode("ascii"))
@@ -1366,9 +1369,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not readable:
                     if time.monotonic() - t_start >= FIRST_BYTE_TIMEOUT_S:
                         if is_last:
-                            self._send_json(504, {"error": {
-                                "message": "[nim-rotator-proxy] upstream timed out waiting for first byte (TTFB)",
-                                "type": "timeout", "code": 504}})
+                            if headers_sent:
+                                self._send_sse_error_envelope(504, "[nim-rotator-proxy] upstream timed out waiting for first byte (TTFB)")
+                            else:
+                                self._send_json(504, {"error": {
+                                    "message": "[nim-rotator-proxy] upstream timed out waiting for first byte (TTFB)",
+                                    "type": "timeout", "code": 504}})
                             return "ok"
                         return "retry"
                     continue
@@ -1378,9 +1384,12 @@ class Handler(BaseHTTPRequestHandler):
                     reset_raw_timeout()
                     if time.monotonic() - t_start >= FIRST_BYTE_TIMEOUT_S:
                         if is_last:
-                            self._send_json(504, {"error": {
-                                "message": "[nim-rotator-proxy] upstream timed out waiting for first byte (TTFB)",
-                                "type": "timeout", "code": 504}})
+                            if headers_sent:
+                                self._send_sse_error_envelope(504, "[nim-rotator-proxy] upstream timed out waiting for first byte (TTFB)")
+                            else:
+                                self._send_json(504, {"error": {
+                                    "message": "[nim-rotator-proxy] upstream timed out waiting for first byte (TTFB)",
+                                    "type": "timeout", "code": 504}})
                             return "ok"
                         return "retry"
                     continue
@@ -1404,15 +1413,22 @@ class Handler(BaseHTTPRequestHandler):
 
                 if not chunk:
                     if is_last:
-                        self._send_json(502, {"error": {
-                            "message": "[nim-rotator-proxy] upstream closed the stream before sending any data",
-                            "type": "server_error", "code": 502}})
+                        if headers_sent:
+                            self._send_sse_error_envelope(502, "[nim-rotator-proxy] upstream closed the stream before sending any data")
+                        else:
+                            self._send_json(502, {"error": {
+                                "message": "[nim-rotator-proxy] upstream closed the stream before sending any data",
+                                "type": "server_error", "code": 502}})
                         return "ok"
                     return "retry"
 
                 peek_buf += chunk
                 if b"\n\n" in peek_buf or len(peek_buf) > 65536:
                     break
+
+            # first data arrived: stop the keepalive thread before relaying
+            if headers_sent:
+                self._stop_convert_keepalive()
 
             first_is_error = False
             if peek_buf:
@@ -1464,14 +1480,15 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            self.send_response(upstream_resp.status)
-            for hk, hv in (extra_headers or {}).items():
-                self.send_header(hk, hv)
-            ct = upstream_resp.getheader("Content-Type", "text/event-stream")
-            self.send_header("Content-Type", ct)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
+            if not headers_sent:
+                self.send_response(upstream_resp.status)
+                for hk, hv in (extra_headers or {}).items():
+                    self.send_header(hk, hv)
+                ct = upstream_resp.getheader("Content-Type", "text/event-stream")
+                self.send_header("Content-Type", ct)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
 
             data_bytes = 0
             data_chunks = 0
